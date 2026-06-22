@@ -164,6 +164,11 @@ setup_ulimit() {
 }
 
 create_venv() {
+    echo -e "${YELLOW}📦 Creating required directories...${NC}"
+    mkdir -p logs data
+    log_ok "Directories created (logs/, data/)"
+
+    echo -e "${YELLOW}📦 Setting up virtual environment...${NC}"
     echo -e "${YELLOW}📦 Setting up virtual environment...${NC}"
     if [ -d "venv" ]; then
         echo -e "${YELLOW}⚠️  venv already exists. Removing old...${NC}"
@@ -186,6 +191,22 @@ EOF
 }
 
 install_requirements() {
+    echo -e "${YELLOW}📦 Installing Python dependencies in venv...${NC}"
+    if [ ! -f "requirements.txt" ]; then
+        create_requirements
+    fi
+    source venv/bin/activate
+    pip install --upgrade pip setuptools wheel -q
+    pip install -r requirements.txt -q
+
+    # Verify critical packages
+    python3 -c "import requests; print('requests OK')" || pip install requests[socks] -q
+    python3 -c "import psutil; print('psutil OK')" || pip install psutil -q
+
+    log_ok "Dependencies installed and verified"
+    return
+
+# OLD install_requirements (replaced above)
     echo -e "${YELLOW}📦 Installing Python dependencies...${NC}"
     if [ ! -f "requirements.txt" ]; then
         create_requirements

